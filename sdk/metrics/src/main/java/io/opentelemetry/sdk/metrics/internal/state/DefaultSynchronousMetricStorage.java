@@ -22,6 +22,8 @@ import io.opentelemetry.sdk.metrics.data.PointData;
 import io.opentelemetry.sdk.metrics.internal.aggregator.Aggregator;
 import io.opentelemetry.sdk.metrics.internal.aggregator.AggregatorHandle;
 import io.opentelemetry.sdk.metrics.internal.aggregator.EmptyMetricData;
+import io.opentelemetry.sdk.metrics.internal.concurrent.AdderUtil;
+import io.opentelemetry.sdk.metrics.internal.concurrent.LongAdder;
 import io.opentelemetry.sdk.metrics.internal.descriptor.MetricDescriptor;
 import io.opentelemetry.sdk.metrics.internal.export.RegisteredReader;
 import io.opentelemetry.sdk.metrics.internal.view.AttributesProcessor;
@@ -254,13 +256,8 @@ public abstract class DefaultSynchronousMetricStorage<T extends PointData>
     private AggregatorHolder<T> getHolderForRecord() {
       do {
         AggregatorHolder<T> aggregatorHolder = this.aggregatorHolder;
-        int recordsInProgress = aggregatorHolder.activeRecordingThreads.addAndGet(2);
-        if (recordsInProgress % 2 == 0) {
+        if (aggregatorHolder.coordinator.tryLockShared()) {
           return aggregatorHolder;
-        } else {
-          // Collect is in progress, decrement recordsInProgress to allow collect to proceed and
-          // re-read aggregatorHolder
-          aggregatorHolder.activeRecordingThreads.addAndGet(-2);
         }
       } while (true);
     }
@@ -270,7 +267,7 @@ public abstract class DefaultSynchronousMetricStorage<T extends PointData>
      * indicate that recording is complete, and it is safe to collect.
      */
     private void releaseHolderForRecord(AggregatorHolder<T> aggregatorHolder) {
-      aggregatorHolder.activeRecordingThreads.addAndGet(-2);
+      aggregatorHolder.coordinator.unlockShared();
     }
 
     @Override
@@ -287,10 +284,7 @@ public abstract class DefaultSynchronousMetricStorage<T extends PointData>
       // record operations should re-read the volatile this.aggregatorHolder.
       // Repeatedly grab recordsInProgress until it is <= 1, which signals all active record
       // operations are complete.
-      int recordsInProgress = holder.activeRecordingThreads.addAndGet(1);
-      while (recordsInProgress > 1) {
-        recordsInProgress = holder.activeRecordingThreads.get();
-      }
+      holder.coordinator.lockExclusive();
       aggregatorHandles = holder.aggregatorHandles;
 
       List<T> points;
@@ -375,23 +369,106 @@ public abstract class DefaultSynchronousMetricStorage<T extends PointData>
     }
   }
 
+  private static class Coordinator {
+    private static final int UNLOCKED = 0;
+    private static final int SHARED_NOT_CONTENDED = 1;
+    private static final int SHARED_CONTENDED = 2;
+    private static final int EXCLUSIVE = 3;
+
+    private final AtomicInteger state = new AtomicInteger();
+    private final LongAdder activeRecordingThreads = AdderUtil.createLongAdder();
+
+    boolean tryLockShared() {
+      while (true) {
+        int currentState = state.get();
+        switch (currentState) {
+          case EXCLUSIVE:
+            return false; // Exclusive lock is held, cannot acquire shared
+          case UNLOCKED:
+            if (state.compareAndSet(UNLOCKED, SHARED_NOT_CONTENDED)) {
+              return true; // Acquired shared lock
+            }
+            break;
+          case SHARED_NOT_CONTENDED:
+            activeRecordingThreads.increment();
+            if (state.compareAndSet(SHARED_NOT_CONTENDED, SHARED_CONTENDED)) {
+              return true; // Acquired shared lock
+            } else {
+              activeRecordingThreads.decrement();
+            }
+            break;
+          case SHARED_CONTENDED:
+            activeRecordingThreads.increment();
+            // Need to re-evaluate state because we might have transitioned to EXCLUSIVE
+            if (state.get() != SHARED_CONTENDED) {
+              activeRecordingThreads.decrement();
+              break; // State changed, retry
+            }
+            return true; // Acquired shared lock
+          default:
+            throw new IllegalStateException("unexpected state: " + currentState);
+        }
+      }
+    }
+
+    void unlockShared() {
+      while (true) {
+        int currentState = state.get();
+        switch (currentState) {
+          case EXCLUSIVE:
+            activeRecordingThreads.decrement();
+            // Exclusive lock is a terminal state, we won't be transitioning back to shared or
+            // unlocked.
+            return;
+          case SHARED_NOT_CONTENDED:
+            if (state.compareAndSet(SHARED_NOT_CONTENDED, UNLOCKED)) {
+              return; // Released shared lock
+            }
+            break;
+          case SHARED_CONTENDED:
+            // We won't be transitioning back to lower states.
+            activeRecordingThreads.decrement();
+            return; // Released shared lock
+          default:
+            throw new IllegalStateException("unexpected state: " + currentState);
+        }
+      }
+    }
+
+    void lockExclusive() {
+      while (true) {
+        int currentState = state.get();
+        switch (currentState) {
+          case UNLOCKED:
+            if (state.compareAndSet(UNLOCKED, EXCLUSIVE)) {
+              return; // Acquired exclusive lock
+            }
+            break;
+          case SHARED_NOT_CONTENDED:
+            // Wait until the shared lock is released, or it transitions to contended state.
+            continue;
+          case SHARED_CONTENDED:
+            if (state.compareAndSet(SHARED_CONTENDED, EXCLUSIVE)) {
+              // We successfully transitioned to exclusive lock, but there may still be active
+              // recording threads. Wait for them to finish before returning.
+              // We are counting down to -1 because we don't increase activeRecordingThreads when
+              // transitioning from UNLOCKED to SHARED_NOT_CONTENDED.
+              while (activeRecordingThreads.sum() >= 0) {
+                // Spin until there are no active recording threads
+              }
+              return; // Acquired exclusive lock
+            }
+            break;
+          default:
+            throw new IllegalStateException("unexpected state: " + currentState);
+        }
+      }
+    }
+  }
+
   private static class AggregatorHolder<T extends PointData> {
     private final ConcurrentHashMap<Attributes, AggregatorHandle<T>> aggregatorHandles;
-    // Recording threads grab the current interval (AggregatorHolder) and atomically increment
-    // this by 2 before recording against it (and then decrement by two when done).
-    //
-    // The collection thread grabs the current interval (AggregatorHolder) and atomically
-    // increments this by 1 to "lock" this interval (and then waits for any active recording
-    // threads to complete before collecting it).
-    //
-    // Recording threads check the return value of their atomic increment, and if it's odd
-    // that means the collector thread has "locked" this interval for collection.
-    //
-    // But before the collector "locks" the interval it sets up a new current interval
-    // (AggregatorHolder), and so if a recording thread encounters an odd value,
-    // all it needs to do is release the "read lock" it just obtained (decrementing by 2),
-    // and then grab and record against the new current interval (AggregatorHolder).
-    private final AtomicInteger activeRecordingThreads = new AtomicInteger(0);
+    private final Coordinator coordinator = new Coordinator();
 
     private AggregatorHolder() {
       aggregatorHandles = new ConcurrentHashMap<>();
